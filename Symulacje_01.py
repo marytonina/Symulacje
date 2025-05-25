@@ -1,86 +1,119 @@
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+from sympy import sympify, symbols
+import math
+import os
 
-#PARAMETRY BIOLOGICZNE (stałe)
-p1 = 8.8       # produkcja p53
-p2 = 440       # produkcja MDM2 (cytoplazmatycznego)
-p3 = 100       # produkcja PTEN
+#Scenariusze
+def build_model_config(scenario: str) -> dict:
+    # Flagi
+    dna_damage = scenario in ["B", "C", "D"]
+    pten_off = scenario in ["C", "D"]
+    siRNA = scenario == "D"
 
-d1 = 1.375e-14 # rozpad p53 przez MDM2_nuc
-d2 = 1.375e-4  # rozpad MDM2 (cytoplazma i jądro)
-d3 = 3e-5      # rozpad PTEN
+    # Bazowe parametry
+    p1 = 8.8
+    p2 = 440
+    p3 = 100
+    d1 = 1.3753e-14
+    d2 = 1.375e-4
+    d3 = 3.0e-5
+    k1 = 1.925e-4
+    k2 = 100000
+    k3 = 150000
 
-k1 = 1.925e-4  # szybkość transportu MDM2 do jądra
-k2 = 1e5       # parametr aktywacji MDM2 przez p53
-k3 = 1000      # parametr wpływu PTEN na transport MDM2
+    # Modyfikacje według scenariusza
+    p2_eff = p2 * 0.02 if siRNA else p2          # siRNA → hamowanie produkcji MDM2
+    p3_eff = 0.0 if pten_off else p3             # brak PTEN
+    d2_eff = d2 * 0.1 if not dna_damage else d2  # brak DNA damage → wolniejszy rozpad MDM2
 
-#FUNKCJA RK4
-def rk4(model, y0, t, **kwargs):
-    h = t[1] - t[0]  # krok całkowania
-    y = np.zeros((len(t), len(y0)))  # macierz wyników
-    y[0] = y0
-    for i in range(1, len(t)):
-        k1_vec = model(y[i-1], t[i-1], **kwargs)
-        k2_vec = model(y[i-1] + 0.5*h*k1_vec, t[i-1] + 0.5*h, **kwargs)
-        k3_vec = model(y[i-1] + 0.5*h*k2_vec, t[i-1] + 0.5*h, **kwargs)
-        k4_vec = model(y[i-1] + h*k3_vec, t[i-1] + h, **kwargs)
-        y[i] = y[i-1] + (h/6)*(k1_vec + 2*k2_vec + 2*k3_vec + k4_vec)
-    return y
+    config = {
+        'options': {'hours': 48, 'dt': 10},
+        'parameters': {
+            'p1': p1, 'p2': p2_eff, 'p3': p3_eff,
+            'd1': d1, 'd2': d2_eff, 'd3': d3,
+            'k1': k1, 'k2': k2, 'k3': k3
+        },
+        'factors': {
+            'p53': {
+                'starting_value': 100,
+                'function': "p1 - (d1 * p53 * MDMn**2)"
+            },
+            'MDMcyt': {
+                'starting_value': 100,
+                'function': "p2 * (p53**4 / (p53**4 + k2**4)) - (k1 * (k3**2 / (k3**2 + PTEN**2)) * MDMcyt) - (d2 * MDMcyt)"
+            },
+            'MDMn': {
+                'starting_value': 100,
+                'function': "(k1 * k3**2 * MDMcyt) / (k3**2 + PTEN**2) - (d2 * MDMn)"
+            },
+            'PTEN': {
+                'starting_value': 0 if pten_off else 100,
+                'function': "p3 * (p53**4 / (p53**4 + k2**4)) - (d3 * PTEN)"
+            }
+        }
+    }
 
-#MODEL BIOLOGICZNY – opisuje zmiany stężeń białek
-def model_p53_adjusted_fixed(y, t, siRNA=False, pten_off=False, dna_damage=False):
-    p53, MDM2_cyt, MDM2_nuc, PTEN = y
+    return config
 
-    # Modyfikacja parametrów w zależności od scenariusza
-    p2_eff = p2 * 0.02 if siRNA else p2        # terapia siRNA → osłabienie produkcji MDM2
-    p3_eff = 0.0 if pten_off else p3           # nowotwór/terapia → brak produkcji PTEN
-    d2_eff = d2 * 0.1 if not dna_damage else d2  # brak uszkodzenia DNA → większy rozpad MDM2
 
-    # Równania różniczkowe opisujące zmiany białek
-    dp53 = p1 - d1 * p53 * MDM2_nuc**2
-    dMDM2_cyt = p2_eff * (p53**4 / (p53**4 + k2**4)) \
-                - k1 * (k3**2 / (k3**2 + PTEN**2)) * MDM2_cyt \
-                - d2_eff * MDM2_cyt
-    dMDM2_nuc = k1 * (k3**2 / (k3**2 + PTEN**2)) * MDM2_cyt - d2_eff * MDM2_nuc
-    dPTEN = p3_eff * (p53**4 / (p53**4 + k2**4)) - d3 * PTEN
+#ALGORYTM RK4
+def simulate(config):
+    factors = config['factors']
+    params = config['parameters']
+    h = config['options']['dt']
+    hours = config['options']['hours']
+    steps = int(3600 * hours / h)
 
-    return np.array([dp53, dMDM2_cyt, dMDM2_nuc, dPTEN])
+    # Inicjalizacja zmiennych i funkcji
+    state = {k: v['starting_value'] for k, v in factors.items()}
+    factor_keys = sorted(factors.keys())
 
-#CZAS SYMULACJI (0–48h co 10 minut)
-t = np.arange(0, 48, 10/60)
+    functions = {
+        k: eval(f"lambda {','.join(factor_keys)}: {sympify(factors[k]['function']).subs({symbols(p): v for p, v in params.items()})}")
+        for k in factors
+    }
 
-#WARTOŚCI POCZĄTKOWE – realistyczna zdrowa komórka
-y0 = [10, 100, 50, 200]  # p53, MDM2_cyt, MDM2_nuc, PTEN
+    rk_buffer = [dict() for _ in range(5)]
+    results = []
 
-#SCENARIUSZE DO ANALIZY
-scenarios = {
-    "A Zdrowa komórka": {"siRNA": False, "pten_off": False, "dna_damage": False},
-    "B Uszkodzenie DNA": {"siRNA": False, "pten_off": False, "dna_damage": True},
-    "C Nowotwór": {"siRNA": False, "pten_off": True, "dna_damage": True},
-    "D Terapia": {"siRNA": True, "pten_off": True, "dna_damage": True},
-}
+    for _ in range(steps):
+        for j, dt_step in enumerate([0, h / 2, h / 2, h]):
+            for key in functions:
+                rk_buffer[4][key] = state[key] + dt_step * rk_buffer[j - 1].get(key, 0)
+            for key in functions:
+                rk_buffer[j][key] = functions[key](**rk_buffer[4])
+        for key in state:
+            state[key] += h / 6 * (rk_buffer[0][key] + 2 * rk_buffer[1][key] + 2 * rk_buffer[2][key] + rk_buffer[3][key])
+        results.append(state.copy())
 
-labels = ["p53", "MDM2_cyt", "MDM2_nuc", "PTEN"]
-results = {}
+    return results
 
-#SYMULACJA DLA KAŻDEGO SCENARIUSZA
-for name, opts in scenarios.items():
-    results[name] = rk4(model_p53_adjusted_fixed, y0, t, **opts)
+#Wykresy
+def plot_results(results, scenario, hours):
+    steps = len(results)
+    for key in results[0]:
+        plt.plot(range(steps), [r[key] for r in results], label=key)
 
-#RYSOWANIE WYKRESÓW
-fig, axs = plt.subplots(2, 2, figsize=(14, 8))
-axs = axs.flatten()
+    plt.xlabel("Czas (h)")
+    plt.ylabel("Liczba cząsteczek")
+    plt.title(f"Symulacja {hours}h – scenariusz {scenario}")
+    plt.xticks(np.linspace(0, steps - 1, 10, dtype=int),
+               labels=[str(int(hours * i / 10)) for i in range(10)])
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    os.makedirs("wykresy", exist_ok=True)
+    plt.savefig(f"wykresy/wykres_{scenario}.jpg")
+    plt.clf()
 
-for ax, (name, y) in zip(axs, results.items()):
-    for i in range(4):
-        ax.plot(t, y[:, i], label=labels[i])
-    ax.set_title(name)
-    ax.set_xlabel("Czas [h]")
-    ax.set_ylabel("Stężenie")
-    ax.set_ylim(0, 750)  # stała skala Y do porównania
-    ax.grid(True)
-    ax.legend()
+#Głowny kod
+if __name__ == "__main__":
+    for scen in ["A", "B", "C", "D"]:
+        print(f"--- Scenariusz {scen} ---")
+        config = build_model_config(scen)
+        results = simulate(config)
+        plot_results(results, scen, config['options']['hours'])
 
-plt.suptitle("Model p53 / PTEN / MDM2 – 48h, poprawione efekty scenariuszy", fontsize=16)
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
+    print("Wszystkie wykresy zapisane w folderze 'wykresy/'.")
+
